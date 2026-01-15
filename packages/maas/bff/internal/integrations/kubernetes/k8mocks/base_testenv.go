@@ -476,20 +476,17 @@ func createMaaSLimitPolicies(k8sClient dynamic.Interface, ctx context.Context, n
 		return err
 	}
 
+	// The token-limit-policy.yaml file is multi-document. Using Decoder instead of Unmarshall
 	tokenLimitYaml, err := os.ReadFile("internal/testdata/token-limit-policy.yaml")
 	if err != nil {
 		return err
 	}
 
-	// Create a decoder to handle multi-document YAML files
 	decoder := yaml.NewDecoder(bytes.NewReader(tokenLimitYaml))
-
-	// Iterate through all documents in the YAML file
 	for {
 		var tokenLimit map[string]interface{}
 		err = decoder.Decode(&tokenLimit)
 		if err == io.EOF {
-			// Reached end of file, all documents processed
 			break
 		}
 		if err != nil {

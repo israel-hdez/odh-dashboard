@@ -136,7 +136,7 @@ func (t *TiersRepository) fetchTierLimits(ctx context.Context, tiers models.Tier
 	for idx := range tiers {
 		tierName := tiers[idx].Name
 
-		// Find and convert token rate limits
+		// Token rate limits
 		tokenPolicyName := "tier-" + tierName + "-token-rate-limits"
 		tokenLimitKey := tierName + "-tokens"
 		tokenPolicy := t.findPolicyByName(tokenPolicyName, tokenPolicies)
@@ -145,7 +145,7 @@ func (t *TiersRepository) fetchTierLimits(ctx context.Context, tiers models.Tier
 			return err
 		}
 
-		// Find and convert request rate limits
+		// Request rate limits
 		ratePolicyName := "tier-" + tierName + "-rate-limits"
 		rateLimitKey := tierName + "-requests"
 		ratePolicy := t.findPolicyByName(ratePolicyName, ratePolicies)
@@ -307,7 +307,7 @@ func (t *TiersRepository) DeleteTierByName(ctx context.Context, name string) err
 	// Clean up rate limit policy resources associated with this tier
 	if err := t.deleteTierRateLimitPolicies(ctx, name); err != nil {
 		t.logger.Warn("Failed to cleanup tier rate limit policies", "tier", name, "error", err)
-		// Continue with tier deletion even if policy cleanup fails
+		return err
 	}
 
 	return t.updateTiersConfigMap(ctx, tierConfigMap, slices.Delete(parsedTiers, tierIdx, tierIdx+1))
@@ -602,7 +602,7 @@ func (t *TiersRepository) createOrUpdateRateLimitPolicies(ctx context.Context, t
 	return errors.Join(errs...)
 }
 
-// findPolicyByName finds a policy resource by its exact name
+// findPolicyByName finds a policy resource by its name
 func (t *TiersRepository) findPolicyByName(policyName string, policies []unstructured.Unstructured) *unstructured.Unstructured {
 	for _, policy := range policies {
 		if policy.GetName() == policyName {
@@ -622,7 +622,6 @@ func (t *TiersRepository) fetchPolicyResources(ctx context.Context) (tokenPolici
 
 	kubeClient := client.GetDynamicClient()
 
-	// Only fetch resources with opendatahub.io/dashboard=true label
 	listOptions := metav1.ListOptions{
 		LabelSelector: "opendatahub.io/dashboard=true",
 	}
