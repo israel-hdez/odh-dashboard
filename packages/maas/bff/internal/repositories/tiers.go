@@ -525,6 +525,9 @@ func buildRateLimitPolicy(tierName, gatewayNamespace, gatewayName string, rateLi
 	policy.SetKind("RateLimitPolicy")
 	policy.SetName(policyName)
 	policy.SetNamespace(gatewayNamespace)
+	policy.SetLabels(map[string]string{
+		"opendatahub.io/dashboard": "true",
+	})
 
 	// Build the policy specification
 	spec := map[string]interface{}{
@@ -564,6 +567,9 @@ func buildTokenRateLimitPolicy(tierName, gatewayNamespace, gatewayName string, r
 	policy.SetKind("TokenRateLimitPolicy")
 	policy.SetName(policyName)
 	policy.SetNamespace(gatewayNamespace)
+	policy.SetLabels(map[string]string{
+		"opendatahub.io/dashboard": "true",
+	})
 
 	// Build the policy specification
 	spec := map[string]interface{}{
@@ -824,6 +830,7 @@ func (t *TiersRepository) cleanupTierFromPolicies(ctx context.Context, tierName 
 }
 
 // fetchPolicyResources consolidates the pattern of fetching both TokenRateLimitPolicy and RateLimitPolicy resources
+// Only fetches managed resources (those with opendatahub.io/dashboard=true label)
 func (t *TiersRepository) fetchPolicyResources(ctx context.Context) (tokenPolicies, ratePolicies []unstructured.Unstructured, err error) {
 	client, err := t.k8sFactory.GetClient(ctx)
 	if err != nil {
@@ -832,12 +839,17 @@ func (t *TiersRepository) fetchPolicyResources(ctx context.Context) (tokenPolici
 
 	kubeClient := client.GetDynamicClient()
 
-	tokenPoliciesList, err := kubeClient.Resource(constants.TokenPolicyGvr).Namespace(t.gatewayNamespace).List(ctx, metav1.ListOptions{})
+	// Only fetch resources with opendatahub.io/dashboard=true label
+	listOptions := metav1.ListOptions{
+		LabelSelector: "opendatahub.io/dashboard=true",
+	}
+
+	tokenPoliciesList, err := kubeClient.Resource(constants.TokenPolicyGvr).Namespace(t.gatewayNamespace).List(ctx, listOptions)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	ratePoliciesList, err := kubeClient.Resource(constants.RatePolicyGvr).Namespace(t.gatewayNamespace).List(ctx, metav1.ListOptions{})
+	ratePoliciesList, err := kubeClient.Resource(constants.RatePolicyGvr).Namespace(t.gatewayNamespace).List(ctx, listOptions)
 	if err != nil {
 		return nil, nil, err
 	}
