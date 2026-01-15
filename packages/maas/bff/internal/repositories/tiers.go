@@ -306,9 +306,123 @@ func (t *TiersRepository) DeleteTierByName(ctx context.Context, name string) err
 	}
 
 	// TODO: Delete side effects? (e.g. models belonging to the tier)
-	// TODO: Remove tier limits (possibly, odh-model-controller task?)
+
+	// Clean up rate limit policy resources associated with this tier
+	if err := t.deleteTierRateLimitPolicies(ctx, name); err != nil {
+		t.logger.Warn("Failed to cleanup tier rate limit policies", "tier", name, "error", err)
+		// Continue with tier deletion even if policy cleanup fails
+	}
 
 	return t.updateTiersConfigMap(ctx, tierConfigMap, slices.Delete(parsedTiers, tierIdx, tierIdx+1))
+}
+
+// deleteTierRateLimitPolicies removes all rate limit policy resources associated with a tier.
+// This function scans for tier-specific policies, deletes managed resources, and cleans up
+// tier entries from other policies.
+func (t *TiersRepository) deleteTierRateLimitPolicies(ctx context.Context, tierName string) error {
+	var errs []error
+
+	// Phase 1: Scan for existing tier-specific policies
+	tierPolicyRefs, scanErr := t.scanExistingTierPolicies(ctx, tierName)
+	if scanErr != nil {
+		t.logger.Warn("Failed to scan existing tier policies during deletion", "tier", tierName, "error", scanErr)
+		return scanErr
+	}
+
+	if len(tierPolicyRefs) == 0 {
+		t.logger.Debug("No tier policies found for deletion", "tier", tierName)
+		return nil
+	}
+
+	t.logger.Info("Found tier policies for deletion", "tier", tierName, "count", len(tierPolicyRefs))
+
+	// Phase 2: Delete tier policy resources
+	client, err := t.k8sFactory.GetClient(ctx)
+	if err != nil {
+		return err
+	}
+
+	kubeClient := client.GetDynamicClient()
+	ourRatePolicyName := "tier-" + tierName + "-rate-limits"
+	ourTokenPolicyName := "tier-" + tierName + "-token-rate-limits"
+
+	for _, policyRef := range tierPolicyRefs {
+		policyName := policyRef.resource.GetName()
+
+		// Check if this is one of our managed resources
+		if policyName == ourRatePolicyName || policyName == ourTokenPolicyName {
+			// Delete the entire managed policy resource
+			err := kubeClient.Resource(policyRef.gvr).Namespace(t.gatewayNamespace).Delete(ctx, policyName, metav1.DeleteOptions{})
+			if err != nil {
+				if !k8sErrors.IsNotFound(err) {
+					t.logger.Warn("Failed to delete tier policy", "tier", tierName, "policy", policyName, "error", err)
+					errs = append(errs, err)
+				}
+			} else {
+				t.logger.Info("Deleted tier policy", "tier", tierName, "policy", policyName)
+			}
+		} else {
+			// For non-managed policies, remove tier-specific limit entries
+			policyContent := policyRef.resource.UnstructuredContent()
+			policyLimits, policyLimitsOk, _ := unstructured.NestedMap(policyContent, "spec", "limits")
+			if !policyLimitsOk {
+				continue
+			}
+
+			// Remove tier-specific limit keys
+			for _, limitKey := range policyRef.limitKeys {
+				delete(policyLimits, limitKey)
+				t.logger.Info("Removed tier limit from policy during deletion",
+					"tier", tierName,
+					"policy", policyName,
+					"limitKey", limitKey)
+			}
+
+			// Check if policy became empty after removing tier limits
+			if len(policyLimits) == 0 {
+				// Delete the entire policy resource
+				err := kubeClient.Resource(policyRef.gvr).Namespace(t.gatewayNamespace).Delete(ctx, policyName, metav1.DeleteOptions{})
+				if err != nil {
+					if !k8sErrors.IsNotFound(err) {
+						t.logger.Warn("Failed to delete empty policy",
+							"policy", policyName,
+							"error", err)
+						errs = append(errs, err)
+					}
+				} else {
+					t.logger.Info("Deleted empty policy after tier deletion",
+						"policy", policyName)
+				}
+			} else {
+				// Update the policy with tier limits removed
+				errSetLimits := unstructured.SetNestedMap(policyRef.resource.Object, policyLimits, "spec", "limits")
+				if errSetLimits != nil {
+					t.logger.Warn("Failed to assign policy limits during deletion",
+						"policy", policyName,
+						"error", errSetLimits)
+					errs = append(errs, errSetLimits)
+				} else {
+					_, updateErr := kubeClient.Resource(policyRef.gvr).Namespace(t.gatewayNamespace).Update(ctx, policyRef.resource, metav1.UpdateOptions{})
+					if updateErr != nil {
+						t.logger.Warn("Failed to update policy during tier deletion",
+							"policy", policyName,
+							"error", updateErr)
+						errs = append(errs, updateErr)
+					} else {
+						t.logger.Info("Updated policy after tier deletion",
+							"policy", policyName)
+					}
+				}
+			}
+		}
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+
+	t.logger.Info("Tier policy deletion completed", "tier", tierName, "policiesProcessed", len(tierPolicyRefs))
+	return nil
 }
 
 // isEmptyLimits checks if the provided TierLimits structure contains any rate limits
