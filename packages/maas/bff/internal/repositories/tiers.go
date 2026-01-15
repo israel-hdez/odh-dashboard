@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
-	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -606,37 +605,32 @@ func (t *TiersRepository) createOrUpdateRateLimitPolicies(ctx context.Context, t
 	return errors.Join(errs...)
 }
 
-// findTierLimitsInPolicies examines policy resources to find tier-specific limit entries
+// findTierLimitsInPolicies finds the managed policy resource for a tier by matching the expected policy name
 func (t *TiersRepository) findTierLimitsInPolicies(tierName string, policies []unstructured.Unstructured, gvr schema.GroupVersionResource) []tierPolicyReference {
 	var tierPolicyRefs []tierPolicyReference
 
+	// Determine expected policy name and limit key based on GVR
+	var expectedPolicyName, limitKey string
+	if gvr == constants.RatePolicyGvr {
+		expectedPolicyName = "tier-" + tierName + "-rate-limits"
+		limitKey = tierName + "-requests"
+	} else if gvr == constants.TokenPolicyGvr {
+		expectedPolicyName = "tier-" + tierName + "-token-rate-limits"
+		limitKey = tierName + "-tokens"
+	} else {
+		return tierPolicyRefs
+	}
+
+	// Find the policy with the expected name
 	for _, policy := range policies {
-		var matchingLimitKeys []string
-
-		if !isGatewayTargetedPolicy(policy, t.gatewayName) {
-			continue
-		}
-
-		policyContent := policy.UnstructuredContent()
-		policyLimits, policyLimitsOk, _ := unstructured.NestedMap(policyContent, "spec", "limits")
-		if !policyLimitsOk {
-			continue
-		}
-
-		for limitKey := range policyLimits {
-			if matchesTierPredicate(policyLimits, limitKey, tierName) {
-				matchingLimitKeys = append(matchingLimitKeys, limitKey)
-			}
-		}
-
-		// If we found tier-specific limits in this policy, add it to our list
-		if len(matchingLimitKeys) > 0 {
+		if policy.GetName() == expectedPolicyName {
 			policyCopy := policy.DeepCopy()
 			tierPolicyRefs = append(tierPolicyRefs, tierPolicyReference{
 				resource:  policyCopy,
 				gvr:       gvr,
-				limitKeys: matchingLimitKeys,
+				limitKeys: []string{limitKey},
 			})
+			break
 		}
 	}
 
@@ -669,38 +663,4 @@ func (t *TiersRepository) fetchPolicyResources(ctx context.Context) (tokenPolici
 	}
 
 	return tokenPoliciesList.Items, ratePoliciesList.Items, nil
-}
-
-// isGatewayTargetedPolicy checks if a policy targets a specific gateway by name
-func isGatewayTargetedPolicy(policy unstructured.Unstructured, gatewayName string) bool {
-	policyContent := policy.UnstructuredContent()
-
-	targetRef, targetRefOk, _ := unstructured.NestedMap(policyContent, "spec", "targetRef")
-	if !targetRefOk {
-		return false
-	}
-
-	targetRefGroup, _ := targetRef["group"].(string)
-	targetRefKind, _ := targetRef["kind"].(string)
-	targetRefName, _ := targetRef["name"].(string)
-
-	return targetRefGroup == "gateway.networking.k8s.io" &&
-		targetRefKind == "Gateway" &&
-		targetRefName == gatewayName
-}
-
-// matchesTierPredicate checks if the predicate of a policy matches a specific tier
-func matchesTierPredicate(policyLimits map[string]interface{}, limitKey, targetTierName string) bool {
-	predicateList, predicateListOk, _ := unstructured.NestedSlice(policyLimits, limitKey, "when")
-	if !predicateListOk || len(predicateList) != 1 {
-		return false
-	}
-
-	predicateValue, predicateOk := predicateList[0].(map[string]interface{})["predicate"].(string)
-	if !predicateOk {
-		return false
-	}
-
-	expectedPredicate := "auth.identity.tier == \"" + targetTierName + "\""
-	return strings.TrimSpace(predicateValue) == expectedPredicate
 }
