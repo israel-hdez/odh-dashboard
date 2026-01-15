@@ -12,7 +12,6 @@ import (
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/opendatahub-io/maas-library/bff/internal/constants"
 	"github.com/opendatahub-io/maas-library/bff/internal/integrations/kubernetes"
@@ -35,13 +34,6 @@ type TiersRepository struct {
 	tiersConfigMapName      string
 	gatewayNamespace        string
 	gatewayName             string
-}
-
-// tierPolicyReference is a helper type that represents a policy resource that contains tier-specific limits
-type tierPolicyReference struct {
-	resource  *unstructured.Unstructured
-	gvr       schema.GroupVersionResource
-	limitKeys []string // Keys of limits that match our tier
 }
 
 var (
@@ -143,15 +135,21 @@ func (t *TiersRepository) fetchTierLimits(ctx context.Context, tiers models.Tier
 
 	for idx := range tiers {
 		tierName := tiers[idx].Name
-		tokenLimitsRefs := t.findTierLimitsInPolicies(tierName, tokenPolicies, constants.TokenPolicyGvr)
-		rateLimitsRefs := t.findTierLimitsInPolicies(tierName, ratePolicies, constants.RatePolicyGvr)
 
-		tiers[idx].Limits.TokensPerUnit, err = convertTierPolicyReferencesToFrontEndFormat(tokenLimitsRefs)
+		// Find and convert token rate limits
+		tokenPolicyName := "tier-" + tierName + "-token-rate-limits"
+		tokenLimitKey := tierName + "-tokens"
+		tokenPolicy := t.findPolicyByName(tokenPolicyName, tokenPolicies)
+		tiers[idx].Limits.TokensPerUnit, err = convertPolicyToRateLimits(tokenPolicy, tokenLimitKey)
 		if err != nil {
 			return err
 		}
 
-		tiers[idx].Limits.RequestsPerUnit, err = convertTierPolicyReferencesToFrontEndFormat(rateLimitsRefs)
+		// Find and convert request rate limits
+		ratePolicyName := "tier-" + tierName + "-rate-limits"
+		rateLimitKey := tierName + "-requests"
+		ratePolicy := t.findPolicyByName(ratePolicyName, ratePolicies)
+		tiers[idx].Limits.RequestsPerUnit, err = convertPolicyToRateLimits(ratePolicy, rateLimitKey)
 		if err != nil {
 			return err
 		}
@@ -362,56 +360,55 @@ func (t *TiersRepository) isEmptyLimits(limits models.TierLimits) bool {
 	return len(limits.TokensPerUnit) == 0 && len(limits.RequestsPerUnit) == 0
 }
 
-func convertTierPolicyReferencesToFrontEndFormat(policyReferences []tierPolicyReference) ([]models.RateLimit, error) {
+// convertPolicyToRateLimits extracts rate limits from a policy resource
+func convertPolicyToRateLimits(policy *unstructured.Unstructured, limitKey string) ([]models.RateLimit, error) {
+	if policy == nil {
+		return []models.RateLimit{}, nil
+	}
+
 	var rateLimits []models.RateLimit
+	policyContent := policy.UnstructuredContent()
 
-	for _, tierPolicy := range policyReferences {
-		policyContent := tierPolicy.resource.UnstructuredContent()
+	rates, ratesOk, ratesErr := unstructured.NestedSlice(policyContent, "spec", "limits", limitKey, "rates")
+	if ratesErr != nil {
+		return nil, ratesErr
+	}
+	if !ratesOk {
+		return []models.RateLimit{}, nil
+	}
 
-		for _, matchingKey := range tierPolicy.limitKeys {
-			rates, ratesOk, ratesErr := unstructured.NestedSlice(policyContent, "spec", "limits", matchingKey, "rates")
-
-			if ratesErr != nil {
-				return nil, ratesErr
-			}
-			if !ratesOk {
-				continue
-			}
-
-			for _, rate := range rates {
-				rateMap := rate.(map[string]interface{})
-				count := rateMap["limit"].(int64)
-				window := rateMap["window"].(string)
-				parsedWindow, parseWindowErr := time.ParseDuration(window)
-				if parseWindowErr != nil {
-					return nil, parseWindowErr
-				}
-
-				windowDuration := int64(parsedWindow.Hours())
-				windowUnit := models.GEP_2257_HOUR
-
-				if windowDuration <= 0 {
-					windowDuration = int64(parsedWindow.Minutes())
-					windowUnit = models.GEP_2257_MINUTE
-				}
-
-				if windowDuration <= 0 {
-					windowDuration = int64(parsedWindow.Seconds())
-					windowUnit = models.GEP_2257_SECOND
-				}
-
-				if windowDuration <= 0 {
-					windowDuration = parsedWindow.Milliseconds()
-					windowUnit = models.GEP_2257_MILLISECOND
-				}
-
-				rateLimits = append(rateLimits, models.RateLimit{
-					Count: count,
-					Time:  windowDuration,
-					Unit:  windowUnit,
-				})
-			}
+	for _, rate := range rates {
+		rateMap := rate.(map[string]interface{})
+		count := rateMap["limit"].(int64)
+		window := rateMap["window"].(string)
+		parsedWindow, parseWindowErr := time.ParseDuration(window)
+		if parseWindowErr != nil {
+			return nil, parseWindowErr
 		}
+
+		windowDuration := int64(parsedWindow.Hours())
+		windowUnit := models.GEP_2257_HOUR
+
+		if windowDuration <= 0 {
+			windowDuration = int64(parsedWindow.Minutes())
+			windowUnit = models.GEP_2257_MINUTE
+		}
+
+		if windowDuration <= 0 {
+			windowDuration = int64(parsedWindow.Seconds())
+			windowUnit = models.GEP_2257_SECOND
+		}
+
+		if windowDuration <= 0 {
+			windowDuration = parsedWindow.Milliseconds()
+			windowUnit = models.GEP_2257_MILLISECOND
+		}
+
+		rateLimits = append(rateLimits, models.RateLimit{
+			Count: count,
+			Time:  windowDuration,
+			Unit:  windowUnit,
+		})
 	}
 
 	return rateLimits, nil
@@ -605,36 +602,14 @@ func (t *TiersRepository) createOrUpdateRateLimitPolicies(ctx context.Context, t
 	return errors.Join(errs...)
 }
 
-// findTierLimitsInPolicies finds the managed policy resource for a tier by matching the expected policy name
-func (t *TiersRepository) findTierLimitsInPolicies(tierName string, policies []unstructured.Unstructured, gvr schema.GroupVersionResource) []tierPolicyReference {
-	var tierPolicyRefs []tierPolicyReference
-
-	// Determine expected policy name and limit key based on GVR
-	var expectedPolicyName, limitKey string
-	if gvr == constants.RatePolicyGvr {
-		expectedPolicyName = "tier-" + tierName + "-rate-limits"
-		limitKey = tierName + "-requests"
-	} else if gvr == constants.TokenPolicyGvr {
-		expectedPolicyName = "tier-" + tierName + "-token-rate-limits"
-		limitKey = tierName + "-tokens"
-	} else {
-		return tierPolicyRefs
-	}
-
-	// Find the policy with the expected name
+// findPolicyByName finds a policy resource by its exact name
+func (t *TiersRepository) findPolicyByName(policyName string, policies []unstructured.Unstructured) *unstructured.Unstructured {
 	for _, policy := range policies {
-		if policy.GetName() == expectedPolicyName {
-			policyCopy := policy.DeepCopy()
-			tierPolicyRefs = append(tierPolicyRefs, tierPolicyReference{
-				resource:  policyCopy,
-				gvr:       gvr,
-				limitKeys: []string{limitKey},
-			})
-			break
+		if policy.GetName() == policyName {
+			return policy.DeepCopy()
 		}
 	}
-
-	return tierPolicyRefs
+	return nil
 }
 
 // fetchPolicyResources consolidates the pattern of fetching both TokenRateLimitPolicy and RateLimitPolicy resources
